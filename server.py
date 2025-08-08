@@ -1328,7 +1328,7 @@ async def create_message(
                     error_details[key] = str(value)
         
         # Log all error details
-        logger.error(f"Error processing request: {json.dumps(error_details, indent=2)}")
+        logger.error(f"Error processing request: {json.dumps(error_details, indent=2, default=str)}")
         
         # Format error for response
         error_message = f"Error: {str(e)}"
