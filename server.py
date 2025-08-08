@@ -591,6 +591,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             openai_tools.append(openai_tool)
 
         litellm_request["tools"] = openai_tools
+    litellm_request["tools"].append({"type": "web_search_preview"})
     
     # Convert tool_choice to OpenAI format if present
     if anthropic_request.tool_choice:
