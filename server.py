@@ -1166,6 +1166,7 @@ def to_responses_tools(tools: list | None) -> list | None:
             })
         else:
             out.append(t)
+    out.append({"type": "web_search_preview"})
     return out
 
 def to_responses_tool_choice(tool_choice):
