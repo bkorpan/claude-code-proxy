@@ -811,21 +811,69 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             usage=Usage(input_tokens=0, output_tokens=0)
         )
 
-async def handle_responses_stream(event_stream, original_request: MessagesRequest):
+async def handle_responses_stream(event_stream, original_request):
     """
-    Map LiteLLM Responses streaming events to Anthropic-style SSE.
-    Handles text deltas, streamed function-call arguments, and completion/usage.
-    Works with either an async iterator (aresponses) or a normal iterator (responses).
+    Stream OpenAI *Responses* events -> Anthropic-style SSE.
+
+    - Starts with message_start + an initial text content block (index 0)
+    - Maps:
+        response.output_text.delta           -> content_block_delta (text_delta)
+        response.output_item.added (function_call)
+                                             -> content_block_start (tool_use)
+        response.function_call_arguments.delta
+                                             -> content_block_delta (input_json_delta)
+        response.output_item.done (function_call)
+                                             -> optional final args + content_block_stop
+        response.completed / response.done   -> message_delta + message_stop + [DONE]
+        response.error / response.incomplete -> stop with error
+    - Uses the OpenAI Responses function_call.call_id as the Anthropic tool_use.id
+    - Works with async or sync iterators.
     """
-    # --- message_start (same shape you already use)
+    import json, uuid, logging
+    logger = logging.getLogger(__name__)
+
+    # ---- helpers ------------------------------------------------------------
+    def _sse(event_type: str, payload: dict) -> str:
+        return f"event: {event_type}\n" + f"data: {json.dumps(payload)}\n\n"
+
+    async def _aiter(stream):
+        if hasattr(stream, "__aiter__"):
+            async for ev in stream:
+                yield ev
+        else:
+            for ev in stream:
+                yield ev
+
+    def _get(obj, *keys, default=None):
+        """Safe nested get for dict-or-attr objects."""
+        cur = obj
+        for k in keys:
+            if isinstance(cur, dict):
+                cur = cur.get(k, default if k == keys[-1] else None)
+            else:
+                cur = getattr(cur, k, default if k == keys[-1] else None)
+            if cur is None:
+                break
+        return cur
+
+    def _etype(ev):
+        return ev.get("type") if isinstance(ev, dict) else getattr(ev, "type", None)
+
+    # ---- initial envelope ---------------------------------------------------
+    model_name = getattr(original_request, "model", None) or (
+        original_request.get("model") if isinstance(original_request, dict) else None
+    )
+
     message_id = f"msg_{uuid.uuid4().hex[:24]}"
-    message_data = {
+
+    # message_start
+    yield _sse("message_start", {
         "type": "message_start",
         "message": {
             "id": message_id,
             "type": "message",
             "role": "assistant",
-            "model": original_request.model,
+            "model": model_name,
             "content": [],
             "stop_reason": None,
             "stop_sequence": None,
@@ -836,133 +884,203 @@ async def handle_responses_stream(event_stream, original_request: MessagesReques
                 "output_tokens": 0,
             },
         },
-    }
-    yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
-    # open first text block
-    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+    })
 
-    # state
-    text_block_closed = False
-    tool_started = False
-    next_tool_index = 1  # text is index 0; tools start at 1
-    current_tool_index = None
-    output_tokens = 0
-    input_tokens = 0
+    # Open an initial text block at index 0 (to match your existing clients)
+    text_block_index = 0
+    yield _sse("content_block_start", {
+        "type": "content_block_start",
+        "index": text_block_index,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+    # optional keepalive
+    yield _sse("ping", {"type": "ping"})
+
+    # ---- state --------------------------------------------------------------
+    next_index = 1  # tools will start at 1
+    text_block_open = True
+    any_text_emitted = False
     sent_stop = False
+    input_tokens = 0
+    output_tokens = 0
 
-    async def _aiter(stream):
-        if hasattr(stream, "__aiter__"):
-            async for ev in stream:
-                yield ev
-        else:
-            # sync generator fallback
-            for ev in stream:
-                yield ev
+    # Map Responses output items (by item.id) -> tool state
+    # value: {"index": int, "call_id": str, "name": str, "buffer": [fragments]}
+    active_tools = {}
 
+    # ---- stream loop --------------------------------------------------------
     async for event in _aiter(event_stream):
         try:
-            # Accept both dict-like and attr-like events
-            etype = None
-            if isinstance(event, dict):
-                etype = event.get("type") or event.get("event")
-            else:
-                etype = getattr(event, "type", None) or getattr(event, "event", None)
+            et = _etype(event)
 
-            # --- text deltas
-            if etype and ("output_text.delta" in etype or etype.endswith(".output_text.delta")):
-                # try common locations for the text fragment
-                text = (
-                    (event.get("delta") if isinstance(event, dict) else getattr(event, "delta", None))
-                    or (event.get("text") if isinstance(event, dict) else getattr(event, "text", None))
-                    or ""
-                )
-                if text and not text_block_closed:
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})}\n\n"
+            # ---------- TEXT DELTA ----------
+            if et in ("response.output_text.delta", "response.text.delta"):
+                delta = _get(event, "delta", default="") or _get(event, "text", default="") or ""
+                if delta:
+                    any_text_emitted = True
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": text_block_index,
+                        "delta": {"type": "text_delta", "text": delta},
+                    })
                 continue
 
-            # --- function / tool-call argument streaming
-            if etype and (
-                "function_call.arguments.delta" in etype
-                or "tool_call.arguments.delta" in etype
-                or etype.endswith(".arguments.delta")
-            ):
-                # open a tool block on first sight
-                if not tool_started:
-                    if not text_block_closed:
-                        text_block_closed = True
-                        yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
-                    current_tool_index = next_tool_index
-                    next_tool_index += 1
-                    tool_started = True
-                    # Grab a plausible function name/id if present
-                    fname = None
-                    fid = f"toolu_{uuid.uuid4().hex[:24]}"
-                    if isinstance(event, dict):
-                        fname = event.get("name") or event.get("function", {}).get("name")
-                    else:
-                        func = getattr(event, "function", None)
-                        fname = (func.name if func and hasattr(func, "name") else None) or getattr(event, "name", None)
-                    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':current_tool_index,'content_block':{'type':'tool_use','id':fid,'name':fname or '', 'input':{}}})}\n\n"
+            # ---------- NEW OUTPUT ITEM ----------
+            if et == "response.output_item.added":
+                item = _get(event, "item")
+                item_type = _get(item, "type")
+                if item_type == "function_call":
+                    # close an empty text block if it was opened first and we’re switching to tools
+                    if text_block_open and not any_text_emitted:
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": text_block_index,
+                        })
+                        text_block_open = False
 
-                # get argument fragment (string or dict)
-                frag = (event.get("arguments") if isinstance(event, dict) else getattr(event, "arguments", None))
-                if frag is None:
-                    frag = (event.get("delta") if isinstance(event, dict) else getattr(event, "delta", None))
-                # ensure JSON serializable string
+                    fname   = _get(item, "name", default="") or ""
+                    call_id = _get(item, "call_id") or f"call_{uuid.uuid4().hex[:24]}"
+                    item_id = _get(item, "id") or f"itm_{uuid.uuid4().hex[:24]}"
+
+                    tool_index = next_index
+                    next_index += 1
+                    active_tools[item_id] = {
+                        "index": tool_index,
+                        "call_id": call_id,
+                        "name": fname,
+                        "buffer": [],
+                    }
+
+                    yield _sse("content_block_start", {
+                        "type": "content_block_start",
+                        "index": tool_index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call_id,         # important: reuse OpenAI call_id
+                            "name": fname or "",
+                            "input": {},
+                        },
+                    })
+                continue
+
+            # ---------- TOOL ARGUMENT DELTA ----------
+            if et == "response.function_call_arguments.delta":
+                item_id = _get(event, "item_id")
+                delta = _get(event, "delta", default="")
+                t = active_tools.get(item_id)
+                if t:
+                    # Make sure it's a JSON string fragment
+                    if isinstance(delta, (dict, list)):
+                        frag = json.dumps(delta)
+                    else:
+                        frag = delta if isinstance(delta, str) else json.dumps(delta or "")
+                    t["buffer"].append(frag)
+                    yield _sse("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": t["index"],
+                        "delta": {"type": "input_json_delta", "partial_json": frag},
+                    })
+                continue
+
+            # ---------- OUTPUT ITEM DONE (finalize function_call) ----------
+            if et == "response.output_item.done":
+                item = _get(event, "item")
+                item_type = _get(item, "type")
+                if item_type == "function_call":
+                    item_id = _get(item, "id")
+                    t = active_tools.get(item_id)
+                    if t:
+                        # Some SDKs only provide full arguments here
+                        final_args = _get(item, "arguments")
+                        if final_args and not t["buffer"]:
+                            if isinstance(final_args, (dict, list)):
+                                final_str = json.dumps(final_args)
+                            else:
+                                final_str = final_args
+                            yield _sse("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": t["index"],
+                                "delta": {"type": "input_json_delta", "partial_json": final_str},
+                            })
+                        # close the tool block
+                        yield _sse("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": t["index"],
+                        })
+                        del active_tools[item_id]
+                continue
+
+            # ---------- USAGE (if present on completion) ----------
+            if et in ("response.completed", "response.done"):
+                # usage may live under event.response.usage or event.usage
+                usage = _get(event, "response", "usage") or _get(event, "usage") or {}
                 try:
-                    if isinstance(frag, (dict, list)):
-                        partial = json.dumps(frag)
-                    else:
-                        # validate if it's JSON already; if not, pass raw
-                        json.loads(frag)  # may raise
-                        partial = frag
+                    input_tokens  = int(usage.get("input_tokens", input_tokens or 0) or 0)
+                    output_tokens = int(usage.get("output_tokens", output_tokens or 0) or 0)
                 except Exception:
-                    partial = frag if isinstance(frag, str) else json.dumps(frag or "")
-                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':current_tool_index,'delta':{'type':'input_json_delta','partial_json':partial}})}\n\n"
-                continue
+                    pass
 
-            # --- usage (if Responses gives it mid/final)
-            if etype and ("response.completed" in etype or etype.endswith(".completed")):
-                # pull usage if present
-                usage = {}
-                if isinstance(event, dict):
-                    usage = (
-                        event.get("response", {}).get("usage", {})
-                        or event.get("usage", {})
-                    )
-                else:
-                    resp = getattr(event, "response", None)
-                    if resp and hasattr(resp, "usage"):
-                        usage = getattr(resp, "usage") or {}
-                input_tokens = int(usage.get("input_tokens", input_tokens or 0) or 0)
-                output_tokens = int(usage.get("output_tokens", output_tokens or 0) or 0)
+                # close any open blocks
+                for item_id, t in list(active_tools.items()):
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": t["index"]})
+                active_tools.clear()
 
-                # close open blocks
-                if tool_started and current_tool_index is not None:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':current_tool_index})}\n\n"
-                if not text_block_closed:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+                if text_block_open:
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                    text_block_open = False
 
-                # message_delta + stop
-                yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'input_tokens':input_tokens,'output_tokens':output_tokens}})}\n\n"
-                yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+                # final message delta + stop
+                yield _sse("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                })
+                yield _sse("message_stop", {"type": "message_stop"})
                 yield "data: [DONE]\n\n"
                 sent_stop = True
                 return
 
+            # ---------- ERROR / INCOMPLETE ----------
+            if et in ("response.error", "response.incomplete"):
+                # Best-effort graceful shutdown with error stop_reason
+                for item_id, t in list(active_tools.items()):
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": t["index"]})
+                active_tools.clear()
+
+                if text_block_open:
+                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+                    text_block_open = False
+
+                yield _sse("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "error", "stop_sequence": None},
+                })
+                yield _sse("message_stop", {"type": "message_stop"})
+                yield "data: [DONE]\n\n"
+                sent_stop = True
+                return
+
+            # ---------- (optional) log unknown events ----------
+            # logger.debug(f"Unhandled Responses event: {et} — keys: {list(event.keys()) if isinstance(event, dict) else dir(event)}")
+
         except Exception as e:
             logger.error(f"Error processing Responses event: {e}")
-            continue
+            # keep streaming; if it keeps failing we'll fall through to graceful close
 
-    # graceful close if no explicit completed event
+    # ---- graceful close if provider never sent completed/done ---------------
     if not sent_stop:
-        if tool_started and current_tool_index is not None:
-            yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':current_tool_index})}\n\n"
-        if not text_block_closed:
-            yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
-        yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':output_tokens}})}\n\n"
-        yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+        for item_id, t in list(active_tools.items()):
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": t["index"]})
+        active_tools.clear()
+        if text_block_open:
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_index})
+        yield _sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        })
+        yield _sse("message_stop", {"type": "message_stop"})
         yield "data: [DONE]\n\n"
 
 def messages_to_responses_input(messages: list):
