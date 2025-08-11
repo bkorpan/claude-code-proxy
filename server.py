@@ -535,8 +535,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     litellm_request = {
         "model": anthropic_request.model,  # t understands "anthropic/claude-x" format
         "messages": messages,
-        "max_tokens": anthropic_request.max_tokens,
-        "temperature": anthropic_request.temperature,
+        "max_completion_tokens": anthropic_request.max_tokens,
         "stream": anthropic_request.stream,
     }
     
