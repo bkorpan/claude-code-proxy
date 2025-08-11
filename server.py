@@ -566,6 +566,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                      logger.error(f"Could not convert tool to dict: {tool}")
                      continue # Skip this tool if conversion fails
 
+            if tool_dict["name"].startswith("Web"):
+                continue # Filter out Anthropic WebSearch and WebFetch tools
+
             # Clean the schema if targeting a Gemini model
             input_schema = tool_dict.get("input_schema", {})
             if is_gemini_model:
