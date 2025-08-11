@@ -531,17 +531,11 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 
                 messages.append({"role": msg.role, "content": processed_content})
     
-    # Cap max_tokens for OpenAI models to their limit of 16384
-    max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
-        logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
-    
     # Create LiteLLM request dict
     litellm_request = {
         "model": anthropic_request.model,  # t understands "anthropic/claude-x" format
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": anthropic_request.max_tokens,
         "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
     }
@@ -1390,6 +1384,7 @@ async def create_message(
                 "input": responses_input,
                 "instructions": instructions,   # only if not None
                 "stream": True,
+                "max_output_tokens": litellm_request.get("max_tokens"),
                 "tools": to_responses_tools(litellm_request.get("tools")),
                 "tool_choice": to_responses_tool_choice(litellm_request.get("tool_choice")),
                 "api_key": litellm_request.get("api_key"),
