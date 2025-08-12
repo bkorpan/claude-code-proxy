@@ -1008,7 +1008,7 @@ async def handle_responses_stream(event_stream, original_request):
                 continue
 
             # ---------- USAGE (if present on completion) ----------
-            if et in ("response.completed", "response.done"):
+            if et in ("response.completed", "response.done", "response.output_text.annotation.added"):
                 # usage may live under event.response.usage or event.usage
                 usage = _get(event, "response", "usage") or _get(event, "usage") or {}
                 try:
