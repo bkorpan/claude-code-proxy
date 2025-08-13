@@ -835,12 +835,53 @@ async def handle_responses_stream(event_stream, original_request, litellm_reques
         return f"event: {event_type}\n" + f"data: {json.dumps(payload)}\n\n"
 
     async def _aiter(stream):
-        if hasattr(stream, "__aiter__"):
-            async for ev in stream:
-                yield ev
+        # Support async iterators that may raise internally during __anext__()
+        if hasattr(stream, "__anext__"):
+            while True:
+                try:
+                    ev = await stream.__anext__()  # pull one event
+                    yield ev
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    # Convert parser/validation/network errors into a Responses-style error event
+                    yield {
+                        "type": "response.error",
+                        "error": {
+                            "message": f"Streaming iterator error: {str(e)}",
+                            "code": "stream_parse_error",
+                            "param": None,
+                        },
+                    }
+                    break
+        # Fallback for sync iterators
+        elif hasattr(stream, "__iter__"):
+            it = iter(stream)
+            while True:
+                try:
+                    yield next(it)
+                except StopIteration:
+                    break
+                except Exception as e:
+                    yield {
+                        "type": "response.error",
+                        "error": {
+                            "message": f"Streaming iterator error: {str(e)}",
+                            "code": "stream_parse_error",
+                            "param": None,
+                        },
+                    }
+                    break
         else:
-            for ev in stream:
-                yield ev
+            # Unknown stream type
+            yield {
+                "type": "response.error",
+                "error": {
+                    "message": "Unsupported event_stream type (not iterable).",
+                    "code": "stream_type_error",
+                    "param": None,
+                },
+            }
 
     def _get(obj, *keys, default=None):
         """Safe nested get for dict-or-attr objects."""
@@ -1037,7 +1078,7 @@ async def handle_responses_stream(event_stream, original_request, litellm_reques
                 return
 
             # ---------- ERROR / INCOMPLETE ----------
-            if et in ("response.error", "response.incomplete"):
+            if et in ("response.error", "response.incomplete", "error"):
                 # Best-effort graceful shutdown with error stop_reason
                 for item_id, t in list(active_tools.items()):
                     yield _sse("content_block_stop", {"type": "content_block_stop", "index": t["index"]})
@@ -1114,7 +1155,7 @@ def messages_to_responses_input(messages: list):
                     "type": "function_call",
                     "name": fn.get("name") or "",
                     "arguments": fn.get("arguments") or "{}",
-                    "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                    "call_id": tc.get("id") or "",
                 })
             # assistant text (if any)
             if as_text:
