@@ -809,7 +809,7 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             usage=Usage(input_tokens=0, output_tokens=0)
         )
 
-async def handle_responses_stream(event_stream, original_request):
+async def handle_responses_stream(event_stream, original_request, litellm_request):
     """
     Stream OpenAI *Responses* events -> Anthropic-style SSE.
 
@@ -900,8 +900,9 @@ async def handle_responses_stream(event_stream, original_request):
     text_block_open = True
     any_text_emitted = False
     sent_stop = False
-    input_tokens = 0
+    input_tokens = litellm.token_counter(messages=litellm_request["messages"])
     output_tokens = 0
+    out_text_parts = []
 
     # Map Responses output items (by item.id) -> tool state
     # value: {"index": int, "call_id": str, "name": str, "buffer": [fragments]}
@@ -917,6 +918,7 @@ async def handle_responses_stream(event_stream, original_request):
                 delta = _get(event, "delta", default="") or _get(event, "text", default="") or ""
                 if delta:
                     any_text_emitted = True
+                    out_text_parts.append(delta)
                     yield _sse("content_block_delta", {
                         "type": "content_block_delta",
                         "index": text_block_index,
@@ -1011,13 +1013,8 @@ async def handle_responses_stream(event_stream, original_request):
 
             # ---------- USAGE (if present on completion) ----------
             if et in ("response.completed", "response.done", "response.output_text.annotation.added"):
-                # usage may live under event.response.usage or event.usage
-                usage = _get(event, "response", "usage") or _get(event, "usage") or {}
-                try:
-                    input_tokens  = int(usage.get("input_tokens", input_tokens or 0) or 0)
-                    output_tokens = int(usage.get("output_tokens", output_tokens or 0) or 0)
-                except Exception:
-                    pass
+                out_text_full = "".join(out_text_parts)
+                output_tokens = litellm.token_counter(messages=[{"role": "assistant", "content": out_text_full}])
 
                 # close any open blocks
                 for item_id, t in list(active_tools.items()):
@@ -1398,7 +1395,7 @@ async def create_message(
             responses_kwargs = {k: v for k, v in responses_kwargs.items() if v is not None}
 
             event_stream = await litellm.aresponses(**responses_kwargs)
-            return StreamingResponse(handle_responses_stream(event_stream, request),
+            return StreamingResponse(handle_responses_stream(event_stream, request, litellm_request),
                                      media_type="text/event-stream")
         else:
             # Use LiteLLM for regular completion
