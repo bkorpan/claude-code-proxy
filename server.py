@@ -92,6 +92,8 @@ SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-5-mini")
 
 # List of OpenAI models
 OPENAI_MODELS = [
+    "gpt-5",
+    "gpt-5-mini",
     "o3-mini",
     "o1",
     "o1-mini",
@@ -102,8 +104,8 @@ OPENAI_MODELS = [
     "chatgpt-4o-latest",
     "gpt-4o-mini",
     "gpt-4o-mini-audio-preview",
-    "gpt-4.1",  # Added default big model
-    "gpt-4.1-mini" # Added default small model
+    "gpt-4.1",
+    "gpt-4.1-mini"
 ]
 
 # List of Gemini models
