@@ -1427,7 +1427,6 @@ async def create_message(
                 "input": responses_input,
                 "instructions": instructions,   # only if not None
                 "stream": True,
-                "max_output_tokens": litellm_request.get("max_tokens"),
                 "tools": to_responses_tools(litellm_request.get("tools")),
                 "tool_choice": to_responses_tool_choice(litellm_request.get("tool_choice")),
                 "api_key": litellm_request.get("api_key"),
